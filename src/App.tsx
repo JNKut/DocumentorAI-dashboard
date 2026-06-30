@@ -5,6 +5,8 @@ interface Service {
   name: string;
   url: string;
   password: string;
+  railwayProjectId?: string;
+  railwayServiceId?: string;
 }
 
 interface PeriodStats {
@@ -27,13 +29,22 @@ interface Analytics {
   };
   documents: Array<{ originalName: string; size: number; chunkCount: number; createdAt: string }>;
   recentConversations: Array<{ sessionId: string; messageCount: number; createdAt: string }>;
+  costs?: {
+    openai: { today: number; thisWeek: number; thisMonth: number; allTime: number };
+  };
 }
 
 type ServiceStatus = { status: 'loading' } | { status: 'ok'; data: Analytics } | { status: 'error'; message: string };
+type CostStatus = { status: 'idle' } | { status: 'loading' } | { status: 'ok'; value: number } | { status: 'error'; message: string };
 
 const SERVICES_KEY = 'dai_dash_services';
 const TOKEN_KEY = 'dai_dash_token';
+const RAILWAY_TOKEN_KEY = 'dai_dash_railway_token';
 const DASH_PASSWORD = import.meta.env.VITE_DASHBOARD_PASSWORD ?? '';
+
+// Railway usage-based pricing rates. Verify at railway.com/pricing if numbers look wrong.
+const RAILWAY_CPU_PER_MIN = 0.000463;   // USD per vCPU-minute
+const RAILWAY_MEM_PER_MIN = 0.000231;   // USD per GB-minute
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -49,25 +60,110 @@ function shortSession(sessionId: string) {
   return sessionId.replace('session_', '').slice(0, 14) + '…';
 }
 
+function fmtUSD(n: number) {
+  if (n < 0.001) return '$0.00';
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+async function fetchEnvironmentId(projectId: string, token: string): Promise<string> {
+  const query = `{ project(id: "${projectId}") { environments { edges { node { id name } } } } }`;
+  const res = await fetch('/api/railway-proxy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, query }),
+  });
+  const json = await res.json();
+  const edges = json?.data?.project?.environments?.edges;
+  if (!edges?.length) throw new Error('No environments found for this project');
+  // Prefer the "production" environment, fall back to the first one
+  const prod = edges.find((e: any) => e.node.name === 'production');
+  return (prod ?? edges[0]).node.id;
+}
+
+async function fetchRailwayCost(svc: Service, token: string): Promise<number> {
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  const endDate = now.toISOString();
+
+  const environmentId = await fetchEnvironmentId(svc.railwayProjectId!, token);
+
+  const metricsQuery = `{
+    metrics(
+      projectId: "${svc.railwayProjectId}"
+      serviceId: "${svc.railwayServiceId}"
+      environmentId: "${environmentId}"
+      startDate: "${startOfMonth}"
+      endDate: "${endDate}"
+      measurements: [CPU_USAGE, MEMORY_USAGE_GB]
+    ) {
+      measurement
+      values { ts value }
+    }
+  }`;
+
+  const mRes = await fetch('/api/railway-proxy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, query: metricsQuery }),
+  });
+  const mJson = await mRes.json();
+
+  if (mJson?.errors?.length) throw new Error(mJson.errors[0].message);
+
+  const metrics: Array<{ measurement: string; values: Array<{ ts: string; value: number }> }> =
+    mJson?.data?.metrics ?? [];
+
+  const cpuMetrics = metrics.find(m => m.measurement === 'CPU_USAGE');
+  const memMetrics = metrics.find(m => m.measurement === 'MEMORY_USAGE_GB');
+
+  const avg = (arr: number[]) => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
+
+  const avgCpu = avg((cpuMetrics?.values ?? []).map(v => v.value));
+  const avgMem = avg((memMetrics?.values ?? []).map(v => v.value));
+
+  const minutesSinceStart = (now.getTime() - new Date(now.getFullYear(), now.getMonth(), 1).getTime()) / 60000;
+
+  return avgCpu * minutesSinceStart * RAILWAY_CPU_PER_MIN + avgMem * minutesSinceStart * RAILWAY_MEM_PER_MIN;
+}
+
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) ?? '');
   const [passwordInput, setPasswordInput] = useState('');
   const [loginError, setLoginError] = useState('');
 
+  const [railwayToken, setRailwayToken] = useState(() => localStorage.getItem(RAILWAY_TOKEN_KEY) ?? '');
+  const [railwayTokenInput, setRailwayTokenInput] = useState('');
+  const [showRailwaySettings, setShowRailwaySettings] = useState(false);
+
   const [services, setServices] = useState<Service[]>(() => {
     try { return JSON.parse(localStorage.getItem(SERVICES_KEY) ?? '[]'); } catch { return []; }
   });
   const [results, setResults] = useState<Record<string, ServiceStatus>>({});
+  const [railwayCosts, setRailwayCosts] = useState<Record<string, CostStatus>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const [addOpen, setAddOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [newUrl, setNewUrl] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [newRailwayProjectId, setNewRailwayProjectId] = useState('');
+  const [newRailwayServiceId, setNewRailwayServiceId] = useState('');
 
   const isAuthed = DASH_PASSWORD ? token === DASH_PASSWORD : true;
 
-  const fetchAll = useCallback((svcs: Service[]) => {
+  const fetchRailwayCosts = useCallback((svcs: Service[], tkn: string) => {
+    if (!tkn) return;
+    svcs.forEach(svc => {
+      if (!svc.railwayProjectId || !svc.railwayServiceId) return;
+      setRailwayCosts(prev => ({ ...prev, [svc.id]: { status: 'loading' } }));
+      fetchRailwayCost(svc, tkn)
+        .then(value => setRailwayCosts(prev => ({ ...prev, [svc.id]: { status: 'ok', value } })))
+        .catch(e => setRailwayCosts(prev => ({ ...prev, [svc.id]: { status: 'error', message: e.message } })));
+    });
+  }, []);
+
+  const fetchAll = useCallback((svcs: Service[], rlwyTkn?: string) => {
     svcs.forEach(svc => {
       setResults(prev => ({ ...prev, [svc.id]: { status: 'loading' } }));
       fetch(`${svc.url.replace(/\/$/, '')}/api/admin/analytics`, {
@@ -80,7 +176,8 @@ export default function App() {
         .then((data: Analytics) => setResults(prev => ({ ...prev, [svc.id]: { status: 'ok', data } })))
         .catch(e => setResults(prev => ({ ...prev, [svc.id]: { status: 'error', message: e.message } })));
     });
-  }, []);
+    fetchRailwayCosts(svcs, rlwyTkn ?? railwayToken);
+  }, [railwayToken, fetchRailwayCosts]);
 
   useEffect(() => {
     if (isAuthed && services.length > 0) fetchAll(services);
@@ -97,13 +194,31 @@ export default function App() {
     }
   }
 
+  function handleSaveRailwayToken(e: React.FormEvent) {
+    e.preventDefault();
+    const tkn = railwayTokenInput.trim();
+    setRailwayToken(tkn);
+    localStorage.setItem(RAILWAY_TOKEN_KEY, tkn);
+    setRailwayTokenInput('');
+    setShowRailwaySettings(false);
+    fetchRailwayCosts(services, tkn);
+  }
+
   function handleAddService(e: React.FormEvent) {
     e.preventDefault();
-    const svc: Service = { id: crypto.randomUUID(), name: newName.trim(), url: newUrl.trim(), password: newPassword };
+    const svc: Service = {
+      id: crypto.randomUUID(),
+      name: newName.trim(),
+      url: newUrl.trim(),
+      password: newPassword,
+      railwayProjectId: newRailwayProjectId.trim() || undefined,
+      railwayServiceId: newRailwayServiceId.trim() || undefined,
+    };
     const updated = [...services, svc];
     setServices(updated);
     localStorage.setItem(SERVICES_KEY, JSON.stringify(updated));
     setNewName(''); setNewUrl(''); setNewPassword('');
+    setNewRailwayProjectId(''); setNewRailwayServiceId('');
     setAddOpen(false);
     fetchAll([svc]);
   }
@@ -113,6 +228,7 @@ export default function App() {
     setServices(updated);
     localStorage.setItem(SERVICES_KEY, JSON.stringify(updated));
     setResults(prev => { const n = { ...prev }; delete n[id]; return n; });
+    setRailwayCosts(prev => { const n = { ...prev }; delete n[id]; return n; });
   }
 
   function handleRefresh() {
@@ -154,6 +270,13 @@ export default function App() {
         </div>
         <div className="flex items-center gap-2">
           <button
+            onClick={() => { setRailwayTokenInput(railwayToken); setShowRailwaySettings(v => !v); }}
+            className={`text-sm px-3 py-1.5 border rounded-lg ${railwayToken ? 'border-green-300 text-green-700 hover:bg-green-50' : 'border-gray-300 text-gray-600 hover:bg-gray-50'}`}
+            title={railwayToken ? 'Railway token configured' : 'Set Railway API token for cost estimates'}
+          >
+            {railwayToken ? '✓ Railway' : 'Railway token'}
+          </button>
+          <button
             onClick={handleRefresh}
             className="text-sm px-3 py-1.5 border border-gray-300 rounded-lg text-gray-600 hover:bg-gray-50"
           >
@@ -176,7 +299,47 @@ export default function App() {
         </div>
       </div>
 
-      <div className="px-6 py-6 space-y-6">
+      <div className="px-6 py-6 space-y-4">
+        {/* Railway token settings panel */}
+        {showRailwaySettings && (
+          <div className="bg-white rounded-xl border border-gray-200 p-5">
+            <h2 className="text-sm font-semibold text-gray-900 mb-1">Railway API Token</h2>
+            <p className="text-xs text-gray-500 mb-3">
+              Used to fetch usage metrics for Railway cost estimates. Generate one at{' '}
+              <a href="https://railway.com/account/tokens" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                railway.com/account/tokens
+              </a>{' '}
+              → click <strong>Create token</strong> → give it a name (e.g. "Dashboard") → copy the token.
+            </p>
+            <form onSubmit={handleSaveRailwayToken} className="flex gap-2">
+              <input
+                type="password"
+                placeholder="••••••••••••••••"
+                value={railwayTokenInput}
+                onChange={e => setRailwayTokenInput(e.target.value)}
+                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                autoFocus
+              />
+              <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">
+                Save
+              </button>
+              {railwayToken && (
+                <button
+                  type="button"
+                  onClick={() => { setRailwayToken(''); localStorage.removeItem(RAILWAY_TOKEN_KEY); setShowRailwaySettings(false); }}
+                  className="px-4 py-2 border border-red-300 text-red-600 rounded-lg text-sm hover:bg-red-50"
+                >
+                  Remove
+                </button>
+              )}
+              <button type="button" onClick={() => setShowRailwaySettings(false)}
+                className="px-4 py-2 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-50">
+                Cancel
+              </button>
+            </form>
+          </div>
+        )}
+
         {/* Add Service Modal */}
         {addOpen && (
           <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center">
@@ -197,6 +360,24 @@ export default function App() {
                   <label className="text-xs font-medium text-gray-700 block mb-1">Admin Password</label>
                   <input required type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)}
                     placeholder="••••••••" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div className="border-t border-gray-100 pt-3">
+                  <p className="text-xs text-gray-500 mb-2">
+                    <strong>Railway IDs</strong> <span className="font-normal">(optional — needed for hosting cost estimates)</span>
+                    <br />Find them in your Railway URL: <code className="bg-gray-100 px-1 rounded">railway.com/project/<strong>PROJECT_ID</strong>/service/<strong>SERVICE_ID</strong></code>
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-xs font-medium text-gray-700 block mb-1">Railway Project ID</label>
+                      <input value={newRailwayProjectId} onChange={e => setNewRailwayProjectId(e.target.value)}
+                        placeholder="c9487815-..." className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    </div>
+                    <div>
+                      <label className="text-xs font-medium text-gray-700 block mb-1">Railway Service ID</label>
+                      <input value={newRailwayServiceId} onChange={e => setNewRailwayServiceId(e.target.value)}
+                        placeholder="d8edb15d-..." className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    </div>
+                  </div>
                 </div>
                 <div className="flex gap-2 pt-1">
                   <button type="submit" className="flex-1 bg-blue-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-blue-700">Add</button>
@@ -227,6 +408,9 @@ export default function App() {
                       <th className="text-center px-3 py-3 font-medium text-gray-600 whitespace-nowrap border-l border-gray-100" colSpan={2}>All Time</th>
                       <th className="text-center px-3 py-3 font-medium text-gray-600 whitespace-nowrap border-l border-gray-100">Avg Msgs</th>
                       <th className="text-center px-3 py-3 font-medium text-gray-600 whitespace-nowrap">Docs</th>
+                      <th className="text-center px-3 py-3 font-medium text-emerald-700 whitespace-nowrap border-l border-emerald-100 bg-emerald-50">OpenAI (mo)</th>
+                      <th className="text-center px-3 py-3 font-medium text-emerald-700 whitespace-nowrap bg-emerald-50">Railway (mo)</th>
+                      <th className="text-center px-3 py-3 font-medium text-emerald-700 whitespace-nowrap bg-emerald-50">Total (mo)</th>
                       <th className="px-3 py-3"></th>
                     </tr>
                     <tr className="bg-gray-50 border-b border-gray-200 text-xs text-gray-400">
@@ -241,13 +425,23 @@ export default function App() {
                       <th className="text-center px-3 pb-2">Msgs</th>
                       <th className="text-center px-3 pb-2 border-l border-gray-100">/Conv</th>
                       <th className="text-center px-3 pb-2"></th>
+                      <th className="text-center px-3 pb-2 border-l border-emerald-100 bg-emerald-50 text-emerald-600">API cost</th>
+                      <th className="text-center px-3 pb-2 bg-emerald-50 text-emerald-600">hosting est.</th>
+                      <th className="text-center px-3 pb-2 bg-emerald-50 text-emerald-600">combined</th>
                       <th className="px-3 pb-2"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
                     {services.map(svc => {
                       const res = results[svc.id];
+                      const railwayCost = railwayCosts[svc.id];
                       const isExpanded = expanded === svc.id;
+                      const openaiMonthly = res?.status === 'ok' ? (res.data.costs?.openai.thisMonth ?? null) : null;
+                      const railwayMonthly = railwayCost?.status === 'ok' ? railwayCost.value : null;
+                      const totalMonthly = openaiMonthly !== null && railwayMonthly !== null
+                        ? openaiMonthly + railwayMonthly
+                        : openaiMonthly !== null ? openaiMonthly : null;
+
                       return (
                         <>
                           <tr key={svc.id} className="hover:bg-gray-50">
@@ -281,6 +475,30 @@ export default function App() {
                               );
                             })()}
                             {!res && <td colSpan={10} />}
+
+                            {/* Cost columns */}
+                            <td className="px-3 py-3 text-center tabular-nums text-emerald-700 border-l border-emerald-100 bg-emerald-50/30 whitespace-nowrap">
+                              {openaiMonthly !== null ? fmtUSD(openaiMonthly) : <span className="text-gray-300">—</span>}
+                            </td>
+                            <td className="px-3 py-3 text-center tabular-nums text-emerald-700 bg-emerald-50/30 whitespace-nowrap">
+                              {!svc.railwayProjectId || !svc.railwayServiceId ? (
+                                <span className="text-gray-300">—</span>
+                              ) : !railwayToken ? (
+                                <span className="text-gray-400 text-xs">no token</span>
+                              ) : railwayCost?.status === 'loading' ? (
+                                <span className="text-gray-400 text-xs">…</span>
+                              ) : railwayCost?.status === 'error' ? (
+                                <span className="text-red-400 text-xs" title={railwayCost.message}>err</span>
+                              ) : railwayCost?.status === 'ok' ? (
+                                `~${fmtUSD(railwayCost.value)}`
+                              ) : (
+                                <span className="text-gray-300">—</span>
+                              )}
+                            </td>
+                            <td className="px-3 py-3 text-center tabular-nums font-medium text-emerald-800 bg-emerald-50/30 whitespace-nowrap">
+                              {totalMonthly !== null ? fmtUSD(totalMonthly) : <span className="text-gray-300">—</span>}
+                            </td>
+
                             <td className="px-3 py-3 text-right">
                               <button onClick={() => handleRemove(svc.id)} className="text-xs text-gray-400 hover:text-red-500">Remove</button>
                             </td>
@@ -289,7 +507,7 @@ export default function App() {
                           {/* Expanded detail rows */}
                           {isExpanded && res?.status === 'ok' && (
                             <tr key={`${svc.id}-detail`}>
-                              <td colSpan={12} className="bg-gray-50 px-6 py-4 border-b border-gray-200">
+                              <td colSpan={15} className="bg-gray-50 px-6 py-4 border-b border-gray-200">
                                 <div className="grid grid-cols-2 gap-6">
                                   {/* Recent conversations */}
                                   <div>
@@ -353,6 +571,9 @@ export default function App() {
                     })}
                   </tbody>
                 </table>
+              </div>
+              <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 text-xs text-gray-400">
+                Railway (mo) is a usage-based estimate and excludes your flat Railway plan fee. OpenAI cost tracked from service deploy date only.
               </div>
             </div>
           </>
