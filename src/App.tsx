@@ -38,9 +38,9 @@ type ServiceStatus = { status: 'loading' } | { status: 'ok'; data: Analytics } |
 type CostStatus = { status: 'idle' } | { status: 'loading' } | { status: 'ok'; value: number } | { status: 'error'; message: string };
 
 const SERVICES_KEY = 'dai_dash_services';
+// Legacy key from when the dashboard password was checked in the browser
 const TOKEN_KEY = 'dai_dash_token';
 const RAILWAY_TOKEN_KEY = 'dai_dash_railway_token';
-const DASH_PASSWORD = import.meta.env.VITE_DASHBOARD_PASSWORD ?? '';
 
 // Railway usage-based pricing rates. Verify at railway.com/pricing if numbers look wrong.
 const RAILWAY_CPU_PER_MIN = 0.000463;   // USD per vCPU-minute
@@ -128,7 +128,10 @@ async function fetchRailwayCost(svc: Service, token: string): Promise<number> {
 }
 
 export default function App() {
-  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) ?? '');
+  // Password is checked by server.js, which sets an HttpOnly session cookie
+  const [auth, setAuth] = useState<{ checked: boolean; required: boolean; authed: boolean }>({
+    checked: false, required: true, authed: false,
+  });
   const [passwordInput, setPasswordInput] = useState('');
   const [loginError, setLoginError] = useState('');
 
@@ -150,7 +153,15 @@ export default function App() {
   const [newRailwayProjectId, setNewRailwayProjectId] = useState('');
   const [newRailwayServiceId, setNewRailwayServiceId] = useState('');
 
-  const isAuthed = DASH_PASSWORD ? token === DASH_PASSWORD : true;
+  const isAuthed = auth.authed;
+
+  useEffect(() => {
+    localStorage.removeItem(TOKEN_KEY);
+    fetch('/api/session')
+      .then(r => r.json())
+      .then(d => setAuth({ checked: true, required: d.authRequired, authed: d.authed }))
+      .catch(() => setAuth({ checked: true, required: true, authed: false }));
+  }, []);
 
   const fetchRailwayCosts = useCallback((svcs: Service[], tkn: string) => {
     if (!tkn) return;
@@ -183,15 +194,30 @@ export default function App() {
     if (isAuthed && services.length > 0) fetchAll(services);
   }, [isAuthed]);
 
-  function handleLogin(e: React.FormEvent) {
+  async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
-    if (passwordInput === DASH_PASSWORD) {
-      setToken(passwordInput);
-      localStorage.setItem(TOKEN_KEY, passwordInput);
-      setLoginError('');
-    } else {
-      setLoginError('Incorrect password');
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: passwordInput }),
+      });
+      if (res.ok) {
+        setPasswordInput('');
+        setLoginError('');
+        setAuth(a => ({ ...a, authed: true }));
+      } else {
+        const d = await res.json().catch(() => ({}));
+        setLoginError(d.error || 'Incorrect password');
+      }
+    } catch {
+      setLoginError('Could not reach the server');
     }
+  }
+
+  async function handleLogout() {
+    await fetch('/api/logout', { method: 'POST' }).catch(() => {});
+    setAuth(a => ({ ...a, authed: false }));
   }
 
   function handleSaveRailwayToken(e: React.FormEvent) {
@@ -233,6 +259,10 @@ export default function App() {
 
   function handleRefresh() {
     fetchAll(services);
+  }
+
+  if (!auth.checked) {
+    return <div className="min-h-screen bg-gray-50" />;
   }
 
   if (!isAuthed) {
@@ -288,9 +318,9 @@ export default function App() {
           >
             + Add Service
           </button>
-          {DASH_PASSWORD && (
+          {auth.required && (
             <button
-              onClick={() => { setToken(''); localStorage.removeItem(TOKEN_KEY); }}
+              onClick={handleLogout}
               className="text-sm px-3 py-1.5 border border-gray-300 rounded-lg text-gray-600 hover:bg-gray-50"
             >
               Logout
